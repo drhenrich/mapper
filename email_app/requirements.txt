@@ -1,0 +1,11 @@
+anthropic>=0.40.0
+streamlit>=1.40.0
+plotly>=5.24.0
+pandas>=2.2.0
+pydantic>=2.9.0
+requests>=2.32.0
+google-api-python-client>=2.150.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+openai>=1.55.0
+streamlit-audio-recorder>=0.0.8
