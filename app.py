@@ -12,9 +12,7 @@ import os
 import json
 import base64
 import sqlite3
-import threading
 import concurrent.futures
-import time
 import re
 import tempfile
 from datetime import datetime, timedelta
@@ -25,6 +23,8 @@ from typing import Optional
 
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
+import pandas as pd
 import anthropic
 import requests
 from pydantic import BaseModel
@@ -349,7 +349,10 @@ Return the full structured categorization.""",
         ],
     )
 
-    data = json.loads(response.content[0].text if hasattr(response.content[0], "text") else response.content[-1].text)
+    text_content = next((b.text for b in response.content if hasattr(b, "text") and b.text), None)
+    if not text_content:
+        return MorningBriefing()
+    data = json.loads(text_content)
     briefing = MorningBriefing(**data)
     # Attach snippet/to from original emails
     id_map = {e["message_id"]: e for e in emails}
@@ -600,13 +603,17 @@ def get_due_followups() -> list[dict]:
     return [{"message_id": r[0], "subject": r[1], "sender": r[2], "date": r[3], "note": r[4]} for r in rows]
 
 
+_VALID_STAT_FIELDS = {"processed", "replied", "snoozed", "archived"}
+
 def record_stat(field: str):
+    if field not in _VALID_STAT_FIELDS:
+        raise ValueError(f"Invalid stat field: {field}")
     today = datetime.now().date().isoformat()
+    col = field  # validated above
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        f"INSERT OR IGNORE INTO stats (date) VALUES (?)", (today,)
-    )
-    conn.execute(f"UPDATE stats SET {field} = {field} + 1 WHERE date = ?", (today,))
+    conn.execute("INSERT OR IGNORE INTO stats (date) VALUES (?)", (today,))
+    # Column name is whitelisted — safe to interpolate
+    conn.execute(f"UPDATE stats SET {col} = {col} + 1 WHERE date = ?", (today,))
     conn.commit()
     conn.close()
 
@@ -760,78 +767,7 @@ def build_treemap(briefing: MorningBriefing) -> go.Figure:
     return fig
 
 
-# ─── Session state init ──────────────────────────────────────────────────────
-for key, default in {
-    "briefing": None,
-    "raw_emails": [],
-    "selected_email": None,
-    "gmail_service": None,
-    "calendar_service": None,
-    "persona": load_persona(),
-    "reply_draft": "",
-    "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-    "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-# ─── Sidebar ─────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ✉️ AI Email Manager")
-    st.markdown("---")
-
-    # API keys
-    with st.expander("🔑 API Keys", expanded=not st.session_state.anthropic_api_key):
-        anthropic_key = st.text_input("Anthropic API Key", value=st.session_state.anthropic_api_key, type="password")
-        openai_key = st.text_input("OpenAI API Key (voice)", value=st.session_state.openai_api_key, type="password")
-        if st.button("Save Keys"):
-            st.session_state.anthropic_api_key = anthropic_key
-            st.session_state.openai_api_key = openai_key
-            st.success("Keys saved.")
-
-    st.markdown("---")
-
-    # Gmail connection
-    if GOOGLE_AVAILABLE:
-        if st.session_state.gmail_service is None:
-            if CREDENTIALS_FILE.exists():
-                if st.button("🔗 Connect Gmail"):
-                    with st.spinner("Connecting to Gmail..."):
-                        svc = get_gmail_service()
-                        if svc:
-                            st.session_state.gmail_service = svc
-                            st.session_state.calendar_service = get_calendar_service()
-                            st.success("Gmail connected!")
-                        else:
-                            st.error("Could not connect. Check credentials.json")
-            else:
-                st.info("Place `credentials.json` in the `email_app/` folder to enable Gmail.")
-        else:
-            st.success("✅ Gmail connected")
-            if st.button("🔄 Refresh Emails"):
-                with st.spinner("Fetching emails..."):
-                    st.session_state.raw_emails = fetch_emails(st.session_state.gmail_service)
-                    st.session_state.briefing = None  # reset to re-analyze
-    else:
-        st.warning("Install google-api-python-client for Gmail integration.")
-
-    st.markdown("---")
-
-    # Demo mode
-    if st.button("📧 Load Demo Emails"):
-        st.session_state.raw_emails = _demo_emails()
-        st.session_state.briefing = None
-        st.info("Demo emails loaded. Click 'Analyze' in the main view.")
-
-    # Follow-up reminders
-    due = get_due_followups()
-    if due:
-        st.markdown("### ⏰ Follow-ups Due")
-        for f in due[:3]:
-            st.warning(f"**{f['subject']}** from {f['sender']}")
-
-
+# ─── Demo emails (must be defined before sidebar references it) ──────────────
 def _demo_emails() -> list[dict]:
     return [
         {
@@ -909,6 +845,82 @@ def _demo_emails() -> list[dict]:
     ]
 
 
+# ─── Session state init ──────────────────────────────────────────────────────
+for key, default in {
+    "briefing": None,
+    "raw_emails": [],
+    "selected_email": None,
+    "gmail_service": None,
+    "calendar_service": None,
+    "persona": load_persona(),
+    "reply_draft": "",
+    "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+    "max_emails": 50,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ─── Sidebar ─────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ✉️ AI Email Manager")
+    st.markdown("---")
+
+    # API keys
+    with st.expander("🔑 API Keys", expanded=not st.session_state.anthropic_api_key):
+        anthropic_key = st.text_input("Anthropic API Key", value=st.session_state.anthropic_api_key, type="password")
+        openai_key = st.text_input("OpenAI API Key (voice)", value=st.session_state.openai_api_key, type="password")
+        if st.button("Save Keys"):
+            st.session_state.anthropic_api_key = anthropic_key
+            st.session_state.openai_api_key = openai_key
+            st.success("Keys saved.")
+
+    st.markdown("---")
+
+    # Gmail connection
+    if GOOGLE_AVAILABLE:
+        if st.session_state.gmail_service is None:
+            if CREDENTIALS_FILE.exists():
+                if st.button("🔗 Connect Gmail"):
+                    with st.spinner("Connecting to Gmail..."):
+                        svc = get_gmail_service()
+                        if svc:
+                            st.session_state.gmail_service = svc
+                            st.session_state.calendar_service = get_calendar_service()
+                            st.success("Gmail connected!")
+                        else:
+                            st.error("Could not connect. Check credentials.json")
+            else:
+                st.info("Place `credentials.json` in the app root folder to enable Gmail.")
+        else:
+            st.success("✅ Gmail connected")
+            if st.button("🔄 Refresh Emails"):
+                with st.spinner("Fetching emails..."):
+                    st.session_state.raw_emails = fetch_emails(
+                        st.session_state.gmail_service,
+                        max_results=st.session_state.max_emails,
+                    )
+                    st.session_state.briefing = None
+    else:
+        st.warning("Install google-api-python-client for Gmail integration.")
+
+    st.markdown("---")
+
+    # Demo mode
+    if st.button("📧 Load Demo Emails"):
+        st.session_state.raw_emails = _demo_emails()
+        st.session_state.briefing = None
+        st.info("Demo emails loaded. Click 'Analyze' in the main view.")
+
+    # Follow-up reminders
+    due = get_due_followups()
+    if due:
+        st.markdown("### ⏰ Follow-ups Due")
+        for f in due[:3]:
+            st.warning(f"**{f['subject']}** from {f['sender']}")
+
+
 # ─── Main tabs ───────────────────────────────────────────────────────────────
 tab_inbox, tab_analytics, tab_crm, tab_persona, tab_settings = st.tabs([
     "📬 Visual Inbox",
@@ -963,25 +975,23 @@ with tab_inbox:
             c3.metric("⚪ Noise", len(b.noise_emails))
 
             # Morning briefing audio
-            briefing_col1, briefing_col2 = st.columns([2, 1])
-            with briefing_col1:
-                if st.button("🔊 Listen to Morning Briefing"):
-                    text = generate_morning_briefing_text(briefing)
-                    audio = text_to_speech(text)
-                    if audio:
-                        st.audio(audio, format="audio/mp3")
-                    else:
-                        st.info(text)
+            if st.button("🔊 Listen to Morning Briefing"):
+                text = generate_morning_briefing_text(briefing)
+                audio = text_to_speech(text)
+                if audio:
+                    st.audio(audio, format="audio/mp3")
+                else:
+                    st.info(text)
 
             # Treemap
             fig = build_treemap(briefing)
-            clicked = st.plotly_chart(fig, use_container_width=True, key="treemap")
+            st.plotly_chart(fig, use_container_width=True, key="treemap")
 
             # Email lists
-            for cat_name, emails, emoji in [
-                ("🔴 Urgent", b.urgent_emails, "🔴"),
-                ("🟡 For Your Info", b.fyi_emails, "🟡"),
-                ("⚪ Noise", b.noise_emails, "⚪"),
+            for cat_name, emails in [
+                ("🔴 Urgent", b.urgent_emails),
+                ("🟡 For Your Info", b.fyi_emails),
+                ("⚪ Noise", b.noise_emails),
             ]:
                 if emails:
                     with st.expander(f"{cat_name} ({len(emails)})", expanded=(cat_name.startswith("🔴"))):
@@ -1058,12 +1068,13 @@ with tab_inbox:
                         st.toast("Transcribed!")
 
             # Draft reply
+            draft_instruction = st.text_input("Special instruction (optional):", key="draft_instruction")
             if not st.session_state.reply_draft:
                 if st.button("✍️ Draft Reply with Claude"):
                     with st.spinner("Drafting..."):
-                        instruction = st.text_input("Special instruction (optional):", key="draft_instruction")
-                        draft = draft_reply_with_claude(sel, st.session_state.persona, instruction)
+                        draft = draft_reply_with_claude(sel, st.session_state.persona, draft_instruction)
                         st.session_state.reply_draft = draft
+                        st.rerun()
 
             reply_text = st.text_area(
                 "Reply:",
@@ -1117,9 +1128,6 @@ with tab_analytics:
 
     stats = get_stats(30)
     if stats:
-        import plotly.express as px
-        import pandas as pd
-
         df = pd.DataFrame(stats)
         df["date"] = pd.to_datetime(df["date"])
 
@@ -1151,7 +1159,6 @@ with tab_crm:
     st.markdown("### 👥 Smart Contact Panel")
     contacts = get_all_contacts()
     if contacts:
-        import pandas as pd
         df_contacts = pd.DataFrame(contacts)
         st.dataframe(df_contacts, use_container_width=True)
 
@@ -1231,7 +1238,7 @@ with tab_settings:
     1. Go to [Google Cloud Console](https://console.cloud.google.com)
     2. Create a project and enable Gmail API + Google Calendar API
     3. Create OAuth 2.0 credentials (Desktop App)
-    4. Download `credentials.json` and place it in the `email_app/` folder
+    4. Download `credentials.json` and place it in the same folder as `app.py`
     5. Click "Connect Gmail" in the sidebar
     """)
 
@@ -1245,11 +1252,7 @@ with tab_settings:
 
     st.markdown("---")
     st.markdown("#### Email Fetch Settings")
-    max_emails = st.slider("Max emails to fetch", 10, 100, 50)
-
-    st.markdown("---")
-    st.markdown("#### Snooze Defaults")
-    snooze_hours = st.select_slider("Default snooze duration", [1, 2, 4, 8, 24], value=4)
+    st.session_state.max_emails = st.slider("Max emails to fetch", 10, 100, st.session_state.max_emails)
 
     st.markdown("---")
     st.markdown("#### Clear Data")
@@ -1267,7 +1270,7 @@ with tab_settings:
     st.markdown("#### About")
     st.markdown("""
     **AI Email Manager** — Superhuman-style email management powered by:
-    - **Claude claude-opus-4-8** (Anthropic) for AI categorization, summarization & reply drafting
+    - **Claude Opus 4.8** (`claude-opus-4-8`, Anthropic) for AI categorization, summarization & reply drafting
     - **Gmail API** for live email access
     - **OpenAI TTS/Whisper** for voice features
     - **Google Calendar API** for meeting scheduling
